@@ -9,6 +9,10 @@ if (!isset($_SESSION['user_id'])) {
     exit();
 }
 
+// Variables para mensajes
+$error = '';
+$success = '';
+
 // Procesar adición al carrito
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_to_cart'])) {
     $product_id = (int)$_POST['product_id'];
@@ -16,11 +20,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_to_cart'])) {
     
     try {
         // Verificar disponibilidad de perfiles
-        $stmt = $pdo->prepare("
-            SELECT profiles_available 
-            FROM products 
-            WHERE id = ?
-        ");
+        $stmt = $pdo->prepare("SELECT profiles_available FROM products WHERE id = ?");
         $stmt->execute([$product_id]);
         $available_profiles = $stmt->fetchColumn();
         
@@ -30,7 +30,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_to_cart'])) {
             exit();
         }
         
-        // Agregar al carrito (ahora manejamos cantidad de perfiles)
+        // Agregar al carrito
         $stmt = $pdo->prepare("
             INSERT INTO cart (user_id, product_id, quantity) 
             VALUES (?, ?, 1)
@@ -45,19 +45,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_to_cart'])) {
         $error = "Error al agregar al carrito: " . $e->getMessage();
     }
 }
-// Resto del código del carrito...
 
-// Variables para mensajes
-$error = '';
-$success = '';
-
-// Obtener el carrito del usuario
+// Obtener el carrito del usuario y calcular total
 $cart_items = [];
 $total = 0;
 
 try {
     $stmt = $pdo->prepare("
-        SELECT c.*, p.name, p.price, p.description 
+        SELECT c.*, p.name, p.price, p.description, p.profiles_available 
         FROM cart c
         JOIN products p ON c.product_id = p.id
         WHERE c.user_id = ?
@@ -73,6 +68,31 @@ try {
     $error = "Error al cargar el carrito: " . $e->getMessage();
 }
 
+// Determinar si puede hacer checkout
+$can_checkout = false;
+$checkout_error = '';
+
+if (!empty($cart_items)) {
+    try {
+        // Verificar stock para todos los items
+        foreach ($cart_items as $item) {
+            if ($item['profiles_available'] < $item['quantity']) {
+                throw new Exception("No hay suficiente stock para: " . $item['name']);
+            }
+        }
+        
+        // Verificar saldo
+        $user_balance = get_user_balance($_SESSION['user_id']);
+        if ($user_balance >= $total) {
+            $can_checkout = true;
+        } else {
+            $checkout_error = "Saldo insuficiente. Por favor recarga tu cuenta.";
+        }
+    } catch (Exception $e) {
+        $checkout_error = $e->getMessage();
+    }
+}
+
 // Procesar actualización de cantidad
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_quantity'])) {
     $cart_id = (int)$_POST['cart_id'];
@@ -83,7 +103,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_quantity'])) {
             $stmt = $pdo->prepare("UPDATE cart SET quantity = ? WHERE id = ? AND user_id = ?");
             $stmt->execute([$quantity, $cart_id, $_SESSION['user_id']]);
             $success = "Carrito actualizado correctamente";
-            header("Refresh:0"); // Recargar para ver cambios
+            header("Location: cart.php");
+            exit();
         } catch (PDOException $e) {
             $error = "Error al actualizar cantidad: " . $e->getMessage();
         }
@@ -100,7 +121,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['remove_item'])) {
         $stmt = $pdo->prepare("DELETE FROM cart WHERE id = ? AND user_id = ?");
         $stmt->execute([$cart_id, $_SESSION['user_id']]);
         $success = "Producto eliminado del carrito";
-        header("Refresh:0"); // Recargar para ver cambios
+        header("Location: cart.php");
+        exit();
     } catch (PDOException $e) {
         $error = "Error al eliminar producto: " . $e->getMessage();
     }
@@ -108,14 +130,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['remove_item'])) {
 
 // Procesar compra
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['checkout'])) {
-    // Verificar saldo suficiente
-    $user_balance = get_user_balance($_SESSION['user_id']);
-    
-    if ($user_balance >= $total) {
+    if ($can_checkout) {
         try {
             $pdo->beginTransaction();
             
-            // 1. Verificar disponibilidad de perfiles
+            // 1. Verificar disponibilidad de perfiles (nuevamente por seguridad)
             foreach ($cart_items as $item) {
                 $stmt = $pdo->prepare("
                     SELECT COUNT(*) 
@@ -138,7 +157,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['checkout'])) {
             
             // 3. Procesar cada item del carrito
             foreach ($cart_items as $item) {
-                // Obtener perfiles disponibles (solución al error)
+                // Obtener perfiles disponibles
                 $sql = "
                     SELECT ap.id, ap.account_id
                     FROM account_profiles ap
@@ -154,14 +173,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['checkout'])) {
                     throw new Exception("No se pudieron reservar suficientes perfiles para: " . $item['name']);
                 }
                 
-                // Resto del proceso de compra...
+                // Asignar perfiles al usuario
                 foreach ($profiles as $profile) {
                     // Marcar perfil como no disponible
-                    $stmt = $pdo->prepare("
-                        UPDATE account_profiles 
-                        SET is_available = FALSE 
-                        WHERE id = ?
-                    ");
+                    $stmt = $pdo->prepare("UPDATE account_profiles SET is_available = FALSE WHERE id = ?");
                     $stmt->execute([$profile['id']]);
                     
                     // Registrar en order_items
@@ -177,7 +192,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['checkout'])) {
                     ]);
                 }
                 
-                // Actualizar disponibilidad de perfiles
+                // Actualizar disponibilidad de perfiles en el producto
                 $stmt = $pdo->prepare("
                     UPDATE products 
                     SET profiles_available = profiles_available - ? 
@@ -203,7 +218,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['checkout'])) {
             $error = "Error al procesar la compra: " . $e->getMessage();
         }
     } else {
-        $error = "Saldo insuficiente. Por favor recarga tu cuenta.";
+        $error = "No se puede completar la compra. " . $checkout_error;
     }
 }
 ?>
@@ -362,16 +377,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['checkout'])) {
                                     </div>
                                     
                                     <form method="POST">
-
-                                    <?php if ($can_checkout): ?>
-                                    <button type="submit" name="checkout" class="btn btn-primary w-100 py-2">
-                                        <i class="bi bi-credit-card me-2"></i>Pagar Ahora
-                                    </button>
-                                    <?php else: ?>
-                                    <div class="alert alert-warning mt-3">
-                                        No se puede completar la compra: <?= htmlspecialchars($error) ?>
-                                    </div>
-                                    <?php endif; ?>
+                                        <?php if (!empty($checkout_error)): ?>
+                                            <div class="alert alert-warning mt-3">
+                                                <?= htmlspecialchars($checkout_error) ?>
+                                            </div>
+                                        <?php endif; ?>
+                                        
+                                        <?php if ($can_checkout): ?>
+                                            <button type="submit" name="checkout" class="btn btn-primary w-100 py-2">
+                                                <i class="bi bi-credit-card me-2"></i>Pagar Ahora
+                                            </button>
+                                        <?php elseif (!empty($cart_items)): ?>
+                                            <button type="button" class="btn btn-secondary w-100 py-2" disabled>
+                                                <i class="bi bi-exclamation-circle me-2"></i>No se puede completar la compra
+                                            </button>
+                                        <?php endif; ?>
                                     </form>
                                     
                                     <div class="mt-3 text-center">
@@ -390,23 +410,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['checkout'])) {
 
     <?php include __DIR__ . '/../includes/user_footer.php'; ?>
 
-
-    
-    
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         // Confirmación antes de pagar
         document.querySelector('button[name="checkout"]')?.addEventListener('click', function(e) {
-            const balance = <?= get_user_balance($_SESSION['user_id']) ?>;
-            const total = <?= $total ?>;
-            
-            if (balance < total) {
-                e.preventDefault();
-                alert('Saldo insuficiente. Por favor recarga tu cuenta.');
-                return false;
-            }
-            
-            return confirm('¿Confirmar compra por $' + total.toFixed(2) + '?');
+            return confirm('¿Confirmar compra por $<?= number_format($total, 2) ?>?');
         });
     </script>
 </body>
